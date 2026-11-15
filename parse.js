@@ -932,6 +932,59 @@ function isAutolinkBoundary(ch) {
 // when scanning a link label (extended autolinks are suppressed
 // there); inRaw0 is the raw-block state inherited from the caller
 // (inside <pre>/<code>/<kbd>/<script> text is not escaped).
+// ---------------- delimiter masking (marked's #n pipeline) ----------------
+// marked searches for emphasis/del closers in a MASKED copy of the
+// inline source: reflink labels, code spans, inline links and HTML
+// tags are replaced by same-length filler, so a delimiter inside
+// one of them cannot close emphasis. A mismatched backtick run can
+// make the mask swallow a fake code span (e.g. the `` `` `` in a
+// link label pairing with a later `` `` ``), hiding real delimiters
+// between them. The three regexes below are marked 18.1.3's own
+// (gfm rules: reflinkSearch, anyPunctuationOutsideCode, blockSkip,
+// link), applied in its order, so delimiter visibility matches
+// marked exactly. All replacements preserve length, so positions
+// in the masked string line up with the original.
+const MASK_REFLINK_SEARCH = /!?\[((?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?)\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\]|!?\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\](?:\[\])?(?!\()/g;
+const MASK_ANY_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const MASK_BLOCK_SKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+const MASK_LINK = /^!?\[((?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\])|[^\[\]\\`])*?)\]\([ \t\n]*(<(?:\\.|[^\n<>\\])+>|[^ \t\n\x00-\x1f]+|(?=\)))(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^)\\])*\)))?[ \t\n]*\)/;
+
+// marked's linkInText: does e contain an inline link or a known
+// reflink (used when a reflink's label itself holds a link)?
+function linkInTextMask(e, refs) {
+  if (!e.includes('[')) return false;
+  for (const n of e.matchAll(MASK_BLOCK_SKIP)) {
+    if (MASK_LINK.test(n[0]) && e.charAt(n.index - 1) !== '!') return true;
+  }
+  for (const n of e.matchAll(MASK_REFLINK_SEARCH)) {
+    const s = n[0], r = s.lastIndexOf('[');
+    if (!(s.charAt(0) === '!' || !refs.has(normalizeLabel(s.slice(r + 1, -1)))) && !(r > 1 && linkInTextMask(s.slice(1, r - 1), refs))) return true;
+  }
+  return false;
+}
+
+// marked's #n: mask reflink labels, then escaped punctuation and
+// code-span contents, then links/code spans/HTML tags.
+function maskInline(text, refs) {
+  let t = text;
+  if (refs.size > 0 && text.includes('[')) {
+    const rs = MASK_REFLINK_SEARCH;
+    const repl = (r) => {
+      const o = r.lastIndexOf('[');
+      if (!refs.has(normalizeLabel(r.slice(o + 1, -1)))) return r;
+      if (o > 1 && r.charAt(0) !== '!') {
+        const i = r.slice(1, o - 1);
+        if (linkInTextMask(i, refs)) return '[' + i.replace(rs, repl) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+      }
+      return '[' + 'a'.repeat(r.length - 2) + ']';
+    };
+    t = t.replace(rs, repl);
+  }
+  t = t.replace(MASK_ANY_PUNCT, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  t = t.replace(MASK_BLOCK_SKIP, (n, s, r) => { const o = r ? r.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
+  return t;
+}
+
 function scanInline(text, refs, inLink, inRaw0) {
   const out = [];
   const n = text.length;
@@ -941,6 +994,26 @@ function scanInline(text, refs, inLink, inRaw0) {
   // unmatched _ openers seen so far in this scan: an email inside
   // _ emphasis is not blocked by its trailing _ closer
   let openUnd = 0;
+  // masked copy for delimiter visibility (marked's #n pipeline),
+  // computed lazily on the first delimiter; only when a maskable
+  // construct (backtick, '[', '<') exists can a delimiter be hidden
+  let masked = null;
+  let maskChecked = false;
+  const ensureMask = () => {
+    if (!maskChecked) {
+      maskChecked = true;
+      if (text.includes('`') || text.includes('[') || text.includes('<')) masked = maskInline(text, refs);
+    }
+    return masked;
+  };
+  // true when every char of the run [a, b) is visible in the masked
+  // source (a delimiter run never straddles a mask boundary)
+  const runVisible = (a, b) => {
+    const m = ensureMask();
+    if (m === null) return true;
+    for (let j = a; j < b; j++) if (m[j] !== text[j]) return false;
+    return true;
+  };
   const flushRun = (to) => {
     if (runStart >= 0 && to > runStart) {
       pushText(out, inRaw ? text.slice(runStart, to) : escText(text.slice(runStart, to)));
@@ -1113,7 +1186,7 @@ function scanInline(text, refs, inLink, inRaw0) {
         canOpen = leftFlank && (!rightFlank || beforePunct);
         canClose = rightFlank && (!leftFlank || afterPunct);
       }
-      out.push({ t: 1, ch, n: len, open: canOpen, close: canClose });
+      out.push({ t: 1, ch, n: len, open: canOpen, close: canClose, vis: runVisible(i, k) });
       if (ch === '_') {
         if (canOpen && !canClose) openUnd++;
         else if (canClose && !canOpen) openUnd = Math.max(0, openUnd - 1);
@@ -1143,6 +1216,8 @@ function scanInline(text, refs, inLink, inRaw0) {
               let m = j;
               while (m < n && text[m] === '~') m++;
               if (m - j === len && j !== k) {
+                // a ~ run hidden by the mask cannot close del
+                if (!runVisible(j, m)) { j = m; continue; }
                 const beforeRun = text[j - 1];
                 if (isWhitespace(beforeRun)) p += len;
                 else {
@@ -1199,6 +1274,9 @@ function resolveEmphasis(nodes) {
     for (let j = i + 1; j < nodes.length; j++) {
       const cand = nodes[j];
       if (cand.t !== 1 || cand.ch !== ch) continue;
+      // a delimiter hidden by the mask is invisible to marked's
+      // closer search: it can neither close nor add to the counter
+      if (cand.vis === false) continue;
       if (!cand.open && !cand.close) continue;
       // marked's emStrong closer regex has a leading alternative
       // ^[^_*]*?__[^_*]*?\*[^_*]*?(?=__): a delimiter inside a
@@ -1210,6 +1288,7 @@ function resolveEmphasis(nodes) {
         for (let k = j - 1; k > i; k--) {
           const nd = nodes[k];
           if (nd.t !== 1) continue;
+          if (nd.vis === false) continue;
           if (nd.ch === opp && nd.n >= 2 && nd.open) { back = k; break; }
           if (nd.ch === ch || nd.ch === opp) break;
         }
@@ -1218,6 +1297,7 @@ function resolveEmphasis(nodes) {
           for (let k = j + 1; k < nodes.length; k++) {
             const nd = nodes[k];
             if (nd.t !== 1) continue;
+            if (nd.vis === false) continue;
             if (nd.ch === opp && nd.n >= 2 && nd.close) { fwd = k; break; }
             if (nd.ch === ch || nd.ch === opp) break;
           }
@@ -1278,14 +1358,14 @@ function resolveEmphasis(nodes) {
     // delimiters stay outside, after the wrapper.
     const closerInside = capped - use;
     const closerOutside = closer.n - capped;
-    if (opener.n - use > 0) kids.unshift({ t: 1, ch, n: opener.n - use, open: opener.open, close: opener.close });
-    if (closerInside > 0) kids.push({ t: 1, ch, n: closerInside, open: closer.open, close: closer.close });
+    if (opener.n - use > 0) kids.unshift({ t: 1, ch, n: opener.n - use, open: opener.open, close: opener.close, vis: opener.vis });
+    if (closerInside > 0) kids.push({ t: 1, ch, n: closerInside, open: closer.open, close: closer.close, vis: closer.vis });
     // resolve emphasis inside the wrapper first (marked
     // tokenizes the inner content recursively)
     resolveEmphasis(kids);
     const wrap = { t: 7, tag, kids };
     const repl = [wrap];
-    if (closerOutside > 0) repl.push({ t: 1, ch, n: closerOutside, open: closer.open, close: closer.close });
+    if (closerOutside > 0) repl.push({ t: 1, ch, n: closerOutside, open: closer.open, close: closer.close, vis: closer.vis });
     nodes.splice(i, matchIdx - i + 1, ...repl);
     // continue after the wrapper
     i = i + 1;
