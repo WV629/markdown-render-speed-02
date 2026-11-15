@@ -417,6 +417,12 @@ const EXTENDED_URL = rx(/^emailProtocol|^((?:protocol):\/\/|www\.)(?:[a-zA-Z0-9\
   .sub("email", EMAIL_GFM)
   .build();
 
+// Characters that can open emphasis or strikethrough (see inlineTokens).
+const EM_CHARS = /[*_~]/;
+
+// Next character that can end a plain-text run (see inlineText).
+const TEXT_STOP = /[\\<\[`*~_!]/;
+
 // Plain text: the catch-all that consumes a run of ordinary characters,
 // stopping before anything that could start another inline construct
 // (backslash, `<`, `[`, backtick, `*`, `~`, `_` at a word boundary, an
@@ -964,7 +970,9 @@ class Tokenizer {
     let rest = src;
     for (; rest;) {
       let emptyItem = false;
-      let itemText = "";
+      // The item's text, built from pieces and joined once at the end
+      // (repeated `+=` on long items is quadratic).
+      const itemParts = [];
       let match = itemPattern.exec(rest);
       if (!match || BLOCK.hr.test(rest)) break;
       const startOffset = full.length - rest.length;
@@ -982,7 +990,7 @@ class Tokenizer {
       } else {
         indent = firstNonSpace(content);
         indent = indent > 4 ? 1 : indent;
-        itemText = content.slice(indent);
+        itemParts.push(content.slice(indent));
         indent += bulletLen;
       }
       // An empty item followed by a blank line ends the item there.
@@ -1015,7 +1023,7 @@ class Tokenizer {
             break;
           }
           if (firstNonSpace(expanded) >= indent || !line.trim()) {
-            itemText += "\n" + expanded.slice(indent);
+            itemParts.push("\n" + expanded.slice(indent));
           } else {
             const contentOps = lineOpeners(content, openerIndent);
             if (
@@ -1034,13 +1042,14 @@ class Tokenizer {
               /^ {0,3}(?:=+|-+) *$/.test(line) && BLOCK.lheading.test(`${content}\n${line}`)
                 ? `    ${expanded.replace(/^ {0,3}/, "")}`
                 : line;
-            itemText += "\n" + setextLine;
+            itemParts.push("\n" + setextLine);
           }
           isEmpty = !line.trim();
           rest = rest.substring(line.length + 1);
           content = expanded.slice(indent);
         }
       }
+      const itemText = itemParts.join("");
       const itemRaw = full.slice(startOffset, full.length - rest.length);
       // A blank line inside one item means the *next* item makes the
       // list loose; a list already loose stays loose.
@@ -1234,6 +1243,7 @@ class Lexer {
   constructor() {
     this.tokens = [];
     this.tokens.links = Object.create(null);
+    this.linkCount = 0;
     this.tokenizer = new Tokenizer();
     this.tokenizer.lexer = this;
     this.inlineQueue = [];
@@ -1336,6 +1346,7 @@ class Lexer {
         } else {
           if (!this.tokens.links[tok.tag]) {
             this.tokens.links[tok.tag] = { href: tok.href, title: tok.title };
+            this.linkCount++;
           }
           tokens.push(tok);
         }
@@ -1399,24 +1410,31 @@ class Lexer {
 
 // Scan `src` for the last delimiter run that could close emphasis:
 // for `*` and `_`, the last run whose preceding character is not
-// whitespace; `~` is tracked separately for strikethrough. Each
-// alternative only matches at a run start: the character before it must
-// be a real character (so a run at position 0 never counts) that is
-// neither whitespace nor the run's own delimiter.
-const DELIM_RUN =
-  /(?<=[^ \t\n\r\f*])(\*+)|(?<=[^ \t\n\r\f_])(_+)|(?<=[^ \t\n\r\f~])(~+)/g;
-function scanDelimiters(src) {
-  let star = -1;
-  let underscore = -1;
-  let tilde = -1;
-  DELIM_RUN.lastIndex = 0;
-  let m;
-  while ((m = DELIM_RUN.exec(src)) !== null) {
-    if (m[1] !== undefined) star = m.index;
-    else if (m[2] !== undefined) underscore = m.index;
-    else tilde = m.index;
+// whitespace; `~` is tracked separately for strikethrough. Working
+// backwards from the end is cheapest: the last run usually qualifies
+// at once, so only a run preceded by whitespace needs another step
+// back. A run at position 0 never counts (nothing precedes it).
+function lastDelimRun(src, ch) {
+  let end = src.length;
+  for (;;) {
+    const i = src.lastIndexOf(ch, end - 1);
+    if (i === -1) return -1;
+    let start = i;
+    while (start > 0 && src[start - 1] === ch) start--;
+    if (start === 0) return -1;
+    const prev = src[start - 1];
+    if (prev !== " " && prev !== "\t" && prev !== "\n" && prev !== "\r" && prev !== "\f") {
+      return start;
+    }
+    end = start;
   }
-  return { maskedSrc: src, lastEmStrong: { "*": star, _: underscore }, lastDel: tilde };
+}
+function scanDelimiters(src) {
+  return {
+    maskedSrc: src,
+    lastEmStrong: { "*": lastDelimRun(src, "*"), _: lastDelimRun(src, "_") },
+    lastDel: lastDelimRun(src, "~"),
+  };
 }
 
 // The mask cache: one stack of scans per tokenizer, because inline
@@ -1456,7 +1474,7 @@ function lastDelIndex(tokenizer, maskedSrc) {
 // brackets cannot pair with anything outside them.
 function maskForEmphasis(lexer, src) {
   let masked = src;
-  if (lexer.tokens.links && src.includes("[")) {
+  if (lexer.linkCount > 0 && src.includes("[")) {
     const search = INLINE.reflinkSearch;
     const maskRef = (match) => {
       const open = match.lastIndexOf("[");
@@ -1771,6 +1789,24 @@ Object.assign(Tokenizer.prototype, {
   },
 
   inlineText(src) {
+    // Fast path: find the next character that can end a text run with
+    // a simple char-class scan, then rule out the complex stops before
+    // it (an email needs `@` anywhere in the rest, since its local part
+    // may hold a special character; `www.`, `://` and a hard break only
+    // matter before that point). Anything else falls back to the full
+    // pattern.
+    const stop = TEXT_STOP.exec(src);
+    const p1 = stop ? stop.index : src.length;
+    if (p1 > 0 && src.indexOf("@") === -1) {
+      const w = src.indexOf("www.");
+      const c = src.indexOf("://");
+      const h = src.indexOf("  \n");
+      if ((w === -1 || w >= p1) && (c === -1 || c >= p1) && (h === -1 || h >= p1)) {
+        const raw = src.slice(0, p1);
+        const inRaw = this.lexer.state.inRawBlock;
+        return { type: "text", raw, text: inRaw ? raw : decodeEntities(raw), escaped: inRaw };
+      }
+    }
     const m = INLINE.text.exec(src);
     if (m) {
       const inRaw = this.lexer.state.inRawBlock;
@@ -1814,7 +1850,7 @@ Object.assign(Lexer.prototype, {
     this.state.linkParenPossible = saved && src.includes(")");
     try {
       const masked =
-        src.includes("*") || src.includes("_") || src.includes("~")
+        EM_CHARS.test(src)
           ? maskForEmphasis(this, src)
           : src;
       pushMask(this.tokenizer, masked);
