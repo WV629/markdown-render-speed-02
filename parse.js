@@ -419,6 +419,9 @@ const EXTENDED_URL = rx(/^emailProtocol|^((?:protocol):\/\/|www\.)(?:[a-zA-Z0-9\
 
 // Characters that can open emphasis or strikethrough (see inlineTokens).
 const EM_CHARS = /[*_~]/;
+// Characters that can start a link, code span, raw tag or backslash
+// escape — the only things the emphasis mask can hide delimiters in.
+const MASK_CHARS = /[`[<\\]/;
 
 // Next character that can end a plain-text run (see inlineText).
 const TEXT_STOP = /[\\<\[`*~_!]/;
@@ -601,9 +604,13 @@ function firstNonSpace(s) {
   return -1;
 }
 
-// Whether a line holds only spaces and tabs (or is empty).
+// Whether a line holds only whitespace (or is empty). Matches what
+// `line.trim()` reports for a single line, without allocating.
 function isBlankLine(s) {
-  for (let i = 0; i < s.length; i++) if (s[i] !== " " && s[i] !== "\t") return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c !== " " && c !== "\t" && c !== "\r" && c !== "\f" && c !== "\v") return false;
+  }
   return true;
 }
 
@@ -1022,7 +1029,7 @@ class Tokenizer {
           ) {
             break;
           }
-          if (firstNonSpace(expanded) >= indent || !line.trim()) {
+          if (firstNonSpace(expanded) >= indent || isBlankLine(line)) {
             itemParts.push("\n" + expanded.slice(indent));
           } else {
             const contentOps = lineOpeners(content, openerIndent);
@@ -1044,7 +1051,7 @@ class Tokenizer {
                 : line;
             itemParts.push("\n" + setextLine);
           }
-          isEmpty = !line.trim();
+          isEmpty = isBlankLine(line);
           rest = rest.substring(line.length + 1);
           content = expanded.slice(indent);
         }
@@ -1440,28 +1447,29 @@ function scanDelimiters(src) {
 // The mask cache: one stack of scans per tokenizer, because inline
 // lexing recurses (an emphasis token's contents are lexed inline again).
 // The top of the stack is the scan for the source currently being lexed.
-const maskCache = new WeakMap();
+// The stack lives on the tokenizer itself (one per lexer, fresh per
+// parse, so nothing is shared across calls).
 function pushMask(tokenizer, maskedSrc) {
   const scan = scanDelimiters(maskedSrc);
-  const stack = maskCache.get(tokenizer);
+  const stack = tokenizer._maskStack;
   if (stack) stack.push(scan);
-  else maskCache.set(tokenizer, [scan]);
+  else tokenizer._maskStack = [scan];
 }
 function popMask(tokenizer) {
-  const stack = maskCache.get(tokenizer);
+  const stack = tokenizer._maskStack;
   if (stack) {
     stack.pop();
-    if (stack.length === 0) maskCache.delete(tokenizer);
+    if (stack.length === 0) tokenizer._maskStack = undefined;
   }
 }
 function lastEmStrongIndex(tokenizer, maskedSrc, delim) {
-  const stack = maskCache.get(tokenizer);
+  const stack = tokenizer._maskStack;
   const top = stack?.[stack.length - 1];
   if (top && top.maskedSrc === maskedSrc) return top.lastEmStrong[delim];
   return scanDelimiters(maskedSrc).lastEmStrong[delim];
 }
 function lastDelIndex(tokenizer, maskedSrc) {
-  const stack = maskCache.get(tokenizer);
+  const stack = tokenizer._maskStack;
   const top = stack?.[stack.length - 1];
   if (top && top.maskedSrc === maskedSrc) return top.lastDel;
   return scanDelimiters(maskedSrc).lastDel;
@@ -1496,7 +1504,7 @@ function maskForEmphasis(lexer, src) {
   // Backslash escapes of punctuation become `+`s, and the contents of
   // code spans keep their fences but lose their backticks. Only a source
   // holding a backslash or a backtick can match either shape.
-  if (masked.includes("\\") || masked.includes("`")) {
+  if (ESCAPE_OR_CODE.test(masked)) {
     masked = masked.replace(INLINE.anyPunctuationOutsideCode, (whole, fence, punct) =>
       punct
         ? "+".repeat(whole.length)
@@ -1507,7 +1515,7 @@ function maskForEmphasis(lexer, src) {
   }
   // Links, code spans and raw tags become `[aaa...]`. Only a source
   // holding `[`, a backtick or `<` can match one.
-  if (masked.includes("[") || masked.includes("`") || masked.includes("<")) {
+  if (CODE_OR_LINK.test(masked)) {
     masked = masked.replace(INLINE.blockSkip, (whole, _codeRun, emptyGroup) => {
       const prefix = emptyGroup ? emptyGroup.length : 0;
       return whole.slice(0, prefix) + "[" + "a".repeat(whole.length - prefix - 2) + "]";
@@ -1515,6 +1523,11 @@ function maskForEmphasis(lexer, src) {
   }
   return masked;
 }
+
+// Whether a string can hold a backslash escape or a code span, and
+// whether it can hold a link, a code span or a raw tag (mask guards).
+const ESCAPE_OR_CODE = /[\\`]/;
+const CODE_OR_LINK = /[`[<]/;
 
 /* ------------------------------------------------------------------ */
 /* Inline tokenizing (methods added to Tokenizer)                      */
@@ -1849,8 +1862,10 @@ Object.assign(Lexer.prototype, {
     const saved = this.state.linkParenPossible;
     this.state.linkParenPossible = saved && src.includes(")");
     try {
+      // The mask only changes the string when a link, code span, raw
+      // tag or backslash escape is present to hide delimiters inside.
       const masked =
-        EM_CHARS.test(src)
+        EM_CHARS.test(src) && MASK_CHARS.test(src)
           ? maskForEmphasis(this, src)
           : src;
       pushMask(this.tokenizer, masked);
