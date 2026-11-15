@@ -2027,8 +2027,14 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
         // marked's ge(): the regex match carries the newlines after
         // the block's last line; a single trailing newline is kept,
         // two or more (a truly empty line follows) are stripped.
-        // A whitespace-only next line still counts as one newline.
-        if (i < n) {
+        // Types 6/7 end at a blank line, and the match swallows
+        // that blank line, so ge() strips the newline entirely;
+        // types 1-5 only carry the newlines right after the last
+        // line, so a whitespace-only next line still counts as
+        // one newline and the trailing newline is kept.
+        if (htype === 6 || htype === 7) {
+          if (i >= n && srcEndsNL) text += '\n';
+        } else if (i < n) {
           if (L[i] !== '') text += '\n';
         } else if (srcEndsNL) {
           text += '\n';
