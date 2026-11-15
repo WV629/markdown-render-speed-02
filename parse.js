@@ -486,11 +486,26 @@ function scanLabel(text, i) {
     if (ch === '`') {
       let k = j;
       while (k < s.length && s[k] === '`') k++;
-      const n = k - j;
-      const cs = scanCodeSpan(s, j, n);
-      if (cs) { j = cs[1]; continue; }
-      j = k;
-      continue;
+      // marked's label regex only allows a backtick run inside a
+      // code span (any closer length, closing before the label's
+      // bracket) or a run of 2+ backticks immediately before the
+      // closing bracket; a lone backtick makes the label invalid
+      let m = k;
+      let closeEnd = -1;
+      while (m < s.length) {
+        if (s[m] === ']') break;
+        if (s[m] === '`') {
+          let e = m;
+          while (e < s.length && s[e] === '`') e++;
+          closeEnd = e;
+          break;
+        }
+        if (s[m] === '\\' && m + 1 < s.length) { m += 2; continue; }
+        m++;
+      }
+      if (closeEnd !== -1) { j = closeEnd; continue; }
+      if (k - j >= 2 && s[k] === ']') { j = k; continue; }
+      return null;
     }
     if (ch === '[') {
       // at most two nested pairs in a label: the label's own
@@ -1772,6 +1787,16 @@ function padCells(cells, n) {
 // in marked's table regex: a blank line, hr, ATX heading,
 // blockquote, fence, html-block start, or a list that starts with
 // a bullet or '1.' / '1)' (other ordered markers do not stop it).
+// marked's table body-row lookahead: a row stops at a line that is
+// only spaces ( *\n  — tabs do not count), an indented code line
+// (?: {4}| {0,3}\t)[^\n], or hr/heading/blockquote/fence/list/html
+function isTableCode(line) {
+  if (line.startsWith('    ') && line.length > 4) return true;
+  let j = 0;
+  while (j < 3 && line[j] === ' ') j++;
+  return line[j] === '\t' && j + 1 < line.length;
+}
+
 function tableRowStops(rest, col) {
   if (col > 3) return false;
   if (isHr(rest) || matchAtx(rest) || rest.startsWith('>') || matchFence(rest) || htmlBlockType(rest) !== 0) return true;
@@ -2224,11 +2249,11 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
       if (table) {
         noteBlock(state, 'table');
         const bodyLines = [];
-        while (i < n && !isBlank(L[i])) {
+        while (i < n && !/^ *$/.test(L[i])) {
           const bl = L[i];
           const bInfo = leadInfo(bl);
           const bRest = bl.slice(bInfo.pos);
-          if (bInfo.col >= 4 || tableRowStops(bRest, bInfo.col)) break;
+          if (isTableCode(bl) || tableRowStops(bRest, bInfo.col)) break;
           bodyLines.push(bl);
           i++;
         }
