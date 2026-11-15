@@ -1182,10 +1182,35 @@ function resolveEmphasis(nodes) {
     let matchIdx = -1;
     let use = 0;
     let capped = 0;
+    let skippedPair = false;
     for (let j = i + 1; j < nodes.length; j++) {
       const cand = nodes[j];
       if (cand.t !== 1 || cand.ch !== ch) continue;
       if (!cand.open && !cand.close) continue;
+      // marked's emStrong closer regex has a leading alternative
+      // ^[^_*]*?__[^_*]*?\*[^_*]*?(?=__): a delimiter inside a
+      // double-delimiter pair of the other char is skipped by the
+      // scan (it belongs to the inner strong, not to this opener)
+      if (!skippedPair) {
+        const opp = ch === '*' ? '_' : '*';
+        let back = -1;
+        for (let k = j - 1; k > i; k--) {
+          const nd = nodes[k];
+          if (nd.t !== 1) continue;
+          if (nd.ch === opp && nd.n >= 2 && nd.open) { back = k; break; }
+          if (nd.ch === ch || nd.ch === opp) break;
+        }
+        if (back !== -1) {
+          let fwd = -1;
+          for (let k = j + 1; k < nodes.length; k++) {
+            const nd = nodes[k];
+            if (nd.t !== 1) continue;
+            if (nd.ch === opp && nd.n >= 2 && nd.close) { fwd = k; break; }
+            if (nd.ch === ch || nd.ch === opp) break;
+          }
+          if (fwd !== -1) { skippedPair = true; continue; }
+        }
+      }
       const b = cand.n;
       const openOnly = cand.open && !cand.close;
       const bothWays = cand.open && cand.close;
