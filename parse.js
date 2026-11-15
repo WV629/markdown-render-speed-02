@@ -604,13 +604,13 @@ function startsProtocol(s, i) {
 // starts are eligible (protocols anywhere, www. after a boundary,
 // mailto:/xmpp: after a non-alphanumeric, emails at a local-part
 // start); this function only validates the match itself.
-function tryExtendedAutolink(text, i) {
+function tryExtendedAutolink(text, i, inUndEm) {
   const s = text;
   const n = s.length;
   // mailto: / xmpp: + email
   for (const proto of ['mailto:', 'xmpp:']) {
     if (s.startsWith(proto, i)) {
-      const em = matchEmailAt(s, i + proto.length);
+      const em = matchEmailAt(s, i + proto.length, inUndEm);
       if (em === -1) return null;
       let end = em;
       if (proto === 'xmpp:' && s[end] === '/') {
@@ -643,7 +643,7 @@ function tryExtendedAutolink(text, i) {
     return [scheme + disp, disp, end];
   }
   // bare email
-  const em = matchEmailAt(s, i);
+  const em = matchEmailAt(s, i, inUndEm);
   if (em !== -1) {
     const disp = s.slice(i, em);
     return ['mailto:' + disp, disp, em];
@@ -654,7 +654,7 @@ function tryExtendedAutolink(text, i) {
 // Match marked's url-email pattern at s[i]. Returns the end index
 // or -1. Local part [A-Za-z0-9._+-]+, @, domain labels with at
 // least one dot, and the next char must not be a word char or '-'.
-function matchEmailAt(s, i) {
+function matchEmailAt(s, i, inUndEm) {
   const n = s.length;
   let j = i;
   while (j < n && isEmailLocal(s[j])) j++;
@@ -667,20 +667,25 @@ function matchEmailAt(s, i) {
   while (j < n && s[j] === '.') {
     let k = j + 1;
     while (k < n && isDomainChar(s[k])) k++;
+    // a dot-group label is [A-Za-z0-9-_]*[A-Za-z0-9]: it must end
+    // on an alphanumeric, so trim any trailing _ or -
+    while (k > j + 1 && !isAlnum(s[k - 1])) k--;
     if (k === j + 1) {
       // a dot not followed by a label: the email ends here, but
       // only when at least one dot-group already matched
       if (labels < 1) return -1;
       break;
     }
-    const lastCh = s[k - 1];
-    if (!((lastCh >= 'a' && lastCh <= 'z') || (lastCh >= 'A' && lastCh <= 'Z') || (lastCh >= '0' && lastCh <= '9'))) return -1;
     labels++;
     j = k;
   }
   if (labels < 1) return -1;
   if (j < n) {
     const c = s[j];
+    // a trailing _ blocks the email, unless it is an emphasis
+    // closer for an unmatched _ opener (marked tokenizes the
+    // emphasis first, so the email inside it never sees the _)
+    if (c === '_' && inUndEm) return j;
     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '_' || c === '-') return -1;
   }
   return j;
@@ -933,6 +938,9 @@ function scanInline(text, refs, inLink, inRaw0) {
   let i = 0;
   let runStart = -1;
   let inRaw = !!inRaw0;
+  // unmatched _ openers seen so far in this scan: an email inside
+  // _ emphasis is not blocked by its trailing _ closer
+  let openUnd = 0;
   const flushRun = (to) => {
     if (runStart >= 0 && to > runStart) {
       pushText(out, inRaw ? text.slice(runStart, to) : escText(text.slice(runStart, to)));
@@ -949,13 +957,13 @@ function scanInline(text, refs, inLink, inRaw0) {
       let ext = null;
       if (!inLink) {
         if ((ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F') && startsProtocol(text, i)) {
-          ext = tryExtendedAutolink(text, i);
+          ext = tryExtendedAutolink(text, i, openUnd > 0);
         } else if (ch === 'w' && text.startsWith('www.', i) && (i === 0 || isAutolinkBoundary(text[i - 1]))) {
-          ext = tryExtendedAutolink(text, i);
+          ext = tryExtendedAutolink(text, i, openUnd > 0);
         } else if ((ch === 'm' || ch === 'x') && (i === 0 || !isAlnum(text[i - 1])) && (text.startsWith('mailto:', i) || text.startsWith('xmpp:', i))) {
-          ext = tryExtendedAutolink(text, i);
-        } else if (isEmailLocal(ch) && (i === 0 || !isEmailLocal(text[i - 1]))) {
-          ext = tryExtendedAutolink(text, i);
+          ext = tryExtendedAutolink(text, i, openUnd > 0);
+        } else if (isEmailLocal(ch) && (i === 0 || !isEmailLocal(text[i - 1]) || (text[i - 1] === '_' && openUnd > 0))) {
+          ext = tryExtendedAutolink(text, i, openUnd > 0);
         }
       }
       if (ext) {
@@ -1106,6 +1114,11 @@ function scanInline(text, refs, inLink, inRaw0) {
         canClose = rightFlank && (!leftFlank || afterPunct);
       }
       out.push({ t: 1, ch, n: len, open: canOpen, close: canClose });
+      if (ch === '_') {
+        if (canOpen && !canClose) openUnd++;
+        else if (canClose && !canOpen) openUnd = Math.max(0, openUnd - 1);
+        else if (canOpen && canClose) { if (openUnd > 0) openUnd--; else openUnd++; }
+      }
       i = k;
       continue;
     }
