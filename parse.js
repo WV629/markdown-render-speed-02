@@ -583,21 +583,32 @@ function isDomainChar(ch) {
 }
 
 // Does text start with http://, https:// or ftp:// at i
-// (case-insensitive)?
+// (case-insensitive)? Raw char comparisons, no toLowerCase.
 function startsProtocol(s, i) {
-  const a = s[i], b = s[i + 1], c = s[i + 2], d = s[i + 3];
-  const la = a === undefined ? '' : a.toLowerCase();
-  const lb = b === undefined ? '' : b.toLowerCase();
-  const lc = c === undefined ? '' : c.toLowerCase();
-  const ld = d === undefined ? '' : d.toLowerCase();
-  if (la === 'h' && lb === 't' && lc === 't' && ld === 'p') {
+  const a = s[i];
+  if (a === 'h' || a === 'H') {
+    const b = s[i + 1];
+    if (b !== 't' && b !== 'T') return false;
+    const c = s[i + 2];
+    if (c !== 't' && c !== 'T') return false;
+    const d = s[i + 3];
+    if (d !== 'p' && d !== 'P') return false;
     if (s[i + 4] === ':' && s[i + 5] === '/' && s[i + 6] === '/') return true;
     if ((s[i + 4] === 's' || s[i + 4] === 'S') && s[i + 5] === ':' && s[i + 6] === '/' && s[i + 7] === '/') return true;
     return false;
   }
-  if (la === 'f' && lb === 't' && lc === 'p' && s[i + 3] === ':' && s[i + 4] === '/' && s[i + 5] === '/') return true;
+  if (a === 'f' || a === 'F') {
+    if (s[i + 1] !== 't' && s[i + 1] !== 'T') return false;
+    if (s[i + 2] !== 'p' && s[i + 2] !== 'P') return false;
+    return s[i + 3] === ':' && s[i + 4] === '/' && s[i + 5] === '/';
+  }
   return false;
 }
+
+// ASCII email-local chars [A-Za-z0-9._+-] as a charCode table, for
+// the inline fast path (avoids a function call per character).
+const EMAIL_LOCAL_T = new Uint8Array(128);
+for (const c of 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-') EMAIL_LOCAL_T[c.charCodeAt(0)] = 1;
 
 // Try an extended autolink starting at text[i]. Returns
 // [href, display, nextPos] or null. The caller decides which
@@ -980,8 +991,16 @@ function maskInline(text, refs) {
     };
     t = t.replace(rs, repl);
   }
-  t = t.replace(MASK_ANY_PUNCT, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
-  t = t.replace(MASK_BLOCK_SKIP, (n, s, r) => { const o = r ? r.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
+  // anyPunctuationOutsideCode can only match a backtick run or a
+  // backslash escape; blockSkip only a link, a code span or a tag
+  // (the passes above only remove such characters, never add them,
+  // so testing the original text is exact)
+  if (text.includes('`') || text.includes('\\')) {
+    t = t.replace(MASK_ANY_PUNCT, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  }
+  if (text.includes('[') || text.includes('`') || text.includes('<')) {
+    t = t.replace(MASK_BLOCK_SKIP, (n, s, r) => { const o = r ? r.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
+  }
   return t;
 }
 
@@ -1029,13 +1048,14 @@ function scanInline(text, refs, inLink, inRaw0) {
       // a local-part start (suppressed inside link labels)
       let ext = null;
       if (!inLink) {
-        if ((ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F') && startsProtocol(text, i)) {
+        const code = text.charCodeAt(i);
+        if ((code === 104 || code === 72 || code === 102 || code === 70) && startsProtocol(text, i)) {
           ext = tryExtendedAutolink(text, i, openUnd > 0);
-        } else if (ch === 'w' && text.startsWith('www.', i) && (i === 0 || isAutolinkBoundary(text[i - 1]))) {
+        } else if (code === 119 && text.charCodeAt(i + 1) === 119 && text.startsWith('www.', i) && (i === 0 || isAutolinkBoundary(text[i - 1]))) {
           ext = tryExtendedAutolink(text, i, openUnd > 0);
-        } else if ((ch === 'm' || ch === 'x') && (i === 0 || !isAlnum(text[i - 1])) && (text.startsWith('mailto:', i) || text.startsWith('xmpp:', i))) {
-          ext = tryExtendedAutolink(text, i, openUnd > 0);
-        } else if (isEmailLocal(ch) && (i === 0 || !isEmailLocal(text[i - 1]) || (text[i - 1] === '_' && openUnd > 0))) {
+        } else if ((code === 109 && text.charCodeAt(i + 1) === 97 && text.startsWith('mailto:', i)) || (code === 120 && text.charCodeAt(i + 1) === 109 && text.startsWith('xmpp:', i))) {
+          if (i === 0 || !isAlnum(text[i - 1])) ext = tryExtendedAutolink(text, i, openUnd > 0);
+        } else if (code < 128 && EMAIL_LOCAL_T[code] === 1 && (i === 0 || !(text.charCodeAt(i - 1) < 128 && EMAIL_LOCAL_T[text.charCodeAt(i - 1)] === 1) || (text[i - 1] === '_' && openUnd > 0))) {
           ext = tryExtendedAutolink(text, i, openUnd > 0);
         }
       }
