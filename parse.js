@@ -843,11 +843,11 @@ function tryLink(text, i, refs, inLink, inRaw) {
   if (href === null) return null;
   const titleEsc = title === null || title === undefined ? null : processEscapesAndEntities(title);
   if (isImage) {
-    const altKids = scanInline(labelText, refs, true, inRaw);
+    const altKids = scanInline(labelText, refs, true, inRaw)[0];
     const alt = renderPlain(altKids);
     return { node: { t: 6, src: href, title: titleEsc, alt, kids: altKids }, nextPos: after };
   }
-  const kids = scanInline(labelText, refs, true, inRaw);
+  const kids = scanInline(labelText, refs, true, inRaw)[0];
   // a link whose label contains a link is discarded (the inner
   // link wins)
   if (hasLinkNode(kids)) return null;
@@ -1144,7 +1144,7 @@ function scanInline(text, refs, inLink, inRaw0) {
           }
           if (closeEnd !== -1) {
             const inner = text.slice(k, closeEnd - len);
-            const kids = scanInline(inner, refs, inLink, inRaw);
+            const kids = scanInline(inner, refs, inLink, inRaw)[0];
             out.push({ t: 7, tag: 'del', kids });
             i = closeEnd;
             continue;
@@ -1160,7 +1160,7 @@ function scanInline(text, refs, inLink, inRaw0) {
     i++;
   }
   flushRun(n);
-  return out;
+  return [out, inLink, inRaw];
 }
 
 // Resolve emphasis/strong delimiters in a node list, following
@@ -1332,9 +1332,18 @@ function renderInto(nodes, parts) {
 // document (even later) are visible when the inline text is
 // rendered. The block pass only assembles thunks and strings;
 // joinOut resolves them after the whole block pass has run.
-function inline(text, refs) {
+function inline(text, refs, ctx) {
   if (text === '') return '';
-  return () => renderNodes(scanInline(text, refs, false));
+  // marked's inLink/inRawBlock state persists across blocks within
+  // one parse (an unclosed <a> or <pre> tag affects later blocks),
+  // so the thunk reads and writes the shared ctx state when it is
+  // resolved (in document order by joinOut)
+  return () => {
+    const res = scanInline(text, refs, ctx.inLink, ctx.inRaw);
+    ctx.inLink = res[1];
+    ctx.inRaw = res[2];
+    return renderNodes(res[0]);
+  };
 }
 
 // Resolve an output array of strings, thunks and nested arrays
@@ -1831,7 +1840,7 @@ function tableRowStops(rest, col) {
   return false;
 }
 
-function renderTable(headerLine, aligns, bodyLines, refs) {
+function renderTable(headerLine, aligns, bodyLines, refs, ctx) {
   const ncols = aligns.length;
   const head = padCells(splitTableRow(headerLine), ncols);
   const out = [];
@@ -1839,7 +1848,7 @@ function renderTable(headerLine, aligns, bodyLines, refs) {
   for (let c = 0; c < ncols; c++) {
     const a = aligns[c];
     out.push('<th' + (a ? ' align="' + a + '"' : '') + '>');
-    out.push(inline(head[c], refs));
+    out.push(inline(head[c], refs, ctx));
     out.push('</th>\n');
   }
   out.push('</tr>\n</thead>\n');
@@ -1850,7 +1859,7 @@ function renderTable(headerLine, aligns, bodyLines, refs) {
     for (let c = 0; c < ncols; c++) {
       const a = aligns[c];
       out.push('<td' + (a ? ' align="' + a + '"' : '') + '>');
-      out.push(inline(cells[c], refs));
+      out.push(inline(cells[c], refs, ctx));
       out.push('</td>\n');
     }
     out.push('</tr>\n');
@@ -1901,7 +1910,7 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
       if (atx) {
         noteBlock(state, 'heading');
         out.push('<h' + atx[0] + '>');
-        out.push(inline(atx[1], ctx.refs));
+        out.push(inline(atx[1], ctx.refs, ctx));
         out.push('</h' + atx[0] + '>\n');
         i++;
         continue;
@@ -2172,7 +2181,7 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
           if (codeLines.length > 0 && q === innerLines.length) {
             const codeText = codeLines.map(cl => isBlank(cl) ? '' : stripCols(cl, 4)).join('\n');
             const newParaText = unit.state.lastParaText + '\n' + codeText;
-            unit.out[unit.state.lastParaThunkIdx] = inline(newParaText, ctx.refs);
+            unit.out[unit.state.lastParaThunkIdx] = inline(newParaText, ctx.refs, ctx);
             unit.state.lastParaText = newParaText;
             consumedThrough = extent[p - 1].idx + 1;
             pos = p;
@@ -2271,7 +2280,7 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
       if (headingLevel > 0) {
         noteBlock(state, 'heading');
         out.push('<h' + headingLevel + '>');
-        out.push(inline(paraLines.join('\n').trim(), ctx.refs));
+        out.push(inline(paraLines.join('\n').trim(), ctx.refs, ctx));
         out.push('</h' + headingLevel + '>\n');
         continue;
       }
@@ -2286,7 +2295,7 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
           bodyLines.push(bl);
           i++;
         }
-        out.push(renderTable(paraLines[0], table, bodyLines, ctx.refs));
+        out.push(renderTable(paraLines[0], table, bodyLines, ctx.refs, ctx));
         continue;
       }
       noteBlock(state, 'paragraph');
@@ -2297,11 +2306,11 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
       state.lastParaText = paraText;
       if (tight) {
         state.lastParaThunkIdx = out.length;
-        out.push(inline(paraText, ctx.refs));
+        out.push(inline(paraText, ctx.refs, ctx));
       } else {
         out.push('<p>');
         state.lastParaThunkIdx = out.length;
-        out.push(inline(paraText, ctx.refs));
+        out.push(inline(paraText, ctx.refs, ctx));
         out.push('</p>\n');
       }
       continue;
@@ -2552,7 +2561,7 @@ export function parse(markdown) {
   // split; dropping it keeps an unterminated fence from gaining an
   // extra newline of content.
   if (src.endsWith('\n')) lines.pop();
-  const ctx = { refs: new Map(), srcEndsNL: src.endsWith('\n') };
+  const ctx = { refs: new Map(), srcEndsNL: src.endsWith('\n'), inLink: false, inRaw: false };
   const out = [];
   renderBlocks(lines, ctx, false, out, ctx.srcEndsNL, {});
   return joinOut(out);
