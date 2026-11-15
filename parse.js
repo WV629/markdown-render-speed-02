@@ -1034,33 +1034,102 @@ function scanInline(text, refs, inLink, inRaw0) {
     return true;
   };
   const flushRun = (to) => {
-    if (runStart >= 0 && to > runStart) {
-      pushText(out, inRaw ? text.slice(runStart, to) : escText(text.slice(runStart, to)));
+    if (runStart >= 0) {
+      if (to > runStart) pushText(out, inRaw ? text.slice(runStart, to) : escText(text.slice(runStart, to)));
+      // always close the run, even when empty: a run started at a
+      // token boundary must not survive to swallow the token's text
       runStart = -1;
     }
   };
+  // Scan for the next interesting position with one regex instead
+  // of a per-character loop: a special character, or a protocol /
+  // www. / mailto: / xmpp: start. Plain text between matches is one
+  // run. Emails are found separately: the next '@' (indexOf, so the
+  // scans are non-overlapping and linear) and the local-part run
+  // before it. A fresh regex per call: scanInline recurses (link
+  // labels, del contents), so no shared /g state.
+  const scanRe = /[`\\&<\[!*_~\n]|[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|www\.|mailto:|xmpp:/g;
+  // next '@' at or after i (-1 when none left), and the start of
+  // the local-part run before it (cached per '@', so the backward
+  // scan runs once per address and the total stays linear)
+  let nextAt = -1;
+  let atRunStart = -1;
+  const findAt = (from) => {
+    nextAt = text.indexOf('@', from);
+    if (nextAt === -1) { atRunStart = -1; return; }
+    let s = nextAt - 1;
+    while (s >= 0 && text.charCodeAt(s) < 128 && EMAIL_LOCAL_T[text.charCodeAt(s)] === 1) s--;
+    atRunStart = s + 1;
+  };
+  findAt(0);
   while (i < n) {
-    const ch = text[i];
-    // fast path: plain text runs
-    if (ch !== '`' && ch !== '\\' && (ch !== '&' || inRaw) && ch !== '<' && ch !== '[' && ch !== '!' && ch !== '*' && ch !== '_' && ch !== '~' && ch !== '\n') {
-      // extended autolinks: protocols anywhere, www. after a
-      // boundary, mailto:/xmpp: after a non-alphanumeric, emails at
-      // a local-part start (suppressed inside link labels)
+    if (nextAt !== -1 && nextAt < i) findAt(i);
+    scanRe.lastIndex = i;
+    const m = scanRe.exec(text);
+    const j = m ? m.index : n;
+    // an email may start in the plain run [i, j): its local part
+    // starts at atRunStart (clamped to i) and its '@' is nextAt.
+    // It is tried when the run starts before the next special
+    // character (a '_' inside the run is part of the address, not a
+    // delimiter); when the run starts at the special character
+    // itself (a '_'), the delimiter is processed first.
+    // (suppressed inside link labels, like all extended autolinks)
+    if (!inLink && nextAt !== -1 && atRunStart < nextAt && Math.max(atRunStart, i) < j) {
+      const s = Math.max(atRunStart, i);
+      if (runStart < 0) runStart = i;
+      const ok = s === 0 || !(text.charCodeAt(s - 1) < 128 && EMAIL_LOCAL_T[text.charCodeAt(s - 1)] === 1) || (text[s - 1] === '_' && openUnd > 0);
+      if (ok) {
+        const em = matchEmailAt(text, s, openUnd > 0);
+        if (em !== -1) {
+          flushRun(s);
+          const disp = text.slice(s, em);
+          const href = cleanUrl('mailto:' + disp);
+          if (href !== null) {
+            out.push({ t: 5, href, title: null, auto: true, kids: [textNode(escText(disp))] });
+            i = em;
+            continue;
+          }
+        }
+      }
+      // no email here: if a '_' sits inside the run, let the
+      // delimiter be processed (it may open _ emphasis, after which
+      // the address is tried again); otherwise resume past the '@'
+      if (j < nextAt) i = j;
+      else i = nextAt + 1;
+      continue;
+    }
+    if (!m) {
+      if (runStart < 0) runStart = i;
+      i = n;
+      break;
+    }
+    const hit = m[0];
+    if (hit.length === 1) {
+      // a special character
+      if (hit === '&' && inRaw) {
+        // raw mode: & is plain text, keep scanning after it
+        if (runStart < 0) runStart = i;
+        i = j + 1;
+        continue;
+      }
+      if (runStart < 0) runStart = i;
+      flushRun(j);
+      i = j;
+    } else {
+      // a protocol / www. / mailto: / xmpp: candidate
+      if (runStart < 0) runStart = i;
       let ext = null;
       if (!inLink) {
-        const code = text.charCodeAt(i);
-        if ((code === 104 || code === 72 || code === 102 || code === 70) && startsProtocol(text, i)) {
-          ext = tryExtendedAutolink(text, i, openUnd > 0);
-        } else if (code === 119 && text.charCodeAt(i + 1) === 119 && text.startsWith('www.', i) && (i === 0 || isAutolinkBoundary(text[i - 1]))) {
-          ext = tryExtendedAutolink(text, i, openUnd > 0);
-        } else if ((code === 109 && text.charCodeAt(i + 1) === 97 && text.startsWith('mailto:', i)) || (code === 120 && text.charCodeAt(i + 1) === 109 && text.startsWith('xmpp:', i))) {
-          if (i === 0 || !isAlnum(text[i - 1])) ext = tryExtendedAutolink(text, i, openUnd > 0);
-        } else if (code < 128 && EMAIL_LOCAL_T[code] === 1 && (i === 0 || !(text.charCodeAt(i - 1) < 128 && EMAIL_LOCAL_T[text.charCodeAt(i - 1)] === 1) || (text[i - 1] === '_' && openUnd > 0))) {
-          ext = tryExtendedAutolink(text, i, openUnd > 0);
+        if (hit === 'www.') {
+          if (j === 0 || isAutolinkBoundary(text[j - 1])) ext = tryExtendedAutolink(text, j, openUnd > 0);
+        } else if (hit === 'mailto:' || hit === 'xmpp:') {
+          if (j === 0 || !isAlnum(text[j - 1])) ext = tryExtendedAutolink(text, j, openUnd > 0);
+        } else {
+          ext = tryExtendedAutolink(text, j, openUnd > 0);
         }
       }
       if (ext) {
-        flushRun(i);
+        flushRun(j);
         const href = cleanUrl(ext[0]);
         if (href !== null) {
           out.push({ t: 5, href, title: null, auto: true, kids: [textNode(escText(ext[1]))] });
@@ -1068,11 +1137,11 @@ function scanInline(text, refs, inLink, inRaw0) {
           continue;
         }
       }
-      if (runStart < 0) runStart = i;
-      i++;
+      // not an autolink: the candidate text is plain; resume past it
+      i = j + hit.length;
       continue;
     }
-    flushRun(i);
+    const ch = text[i];
     if (ch === '\n') {
       // hard break when the preceding text ends with 2+ spaces;
       // the break consumes the newline and any following spaces
