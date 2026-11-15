@@ -2024,14 +2024,12 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
           }
         }
         let text = blockLines.join('\n');
-        // trailing newline: when the next line is non-blank, or the
-        // block ends at EOF and the source ended with a newline
-        let hasMore = false;
-        for (let k = i; k < n; k++) {
-          if (!isBlank(L[k])) { hasMore = true; break; }
-        }
-        if (hasMore) {
-          if (!isBlank(L[i])) text += '\n';
+        // marked's ge(): the regex match carries the newlines after
+        // the block's last line; a single trailing newline is kept,
+        // two or more (a truly empty line follows) are stripped.
+        // A whitespace-only next line still counts as one newline.
+        if (i < n) {
+          if (L[i] !== '') text += '\n';
         } else if (srcEndsNL) {
           text += '\n';
         }
