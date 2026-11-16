@@ -56,8 +56,12 @@ function escNoEncode(s) {
   return out;
 }
 
-// Escape text for HTML output: & < > " ' (all & escaped)
+// Escape text for HTML output: & < > " ' (all & escaped).
+// A regex test (C++ scan) rejects the common no-special-char case
+// far faster than the per-character loop below.
+const ESC_TEXT_RE = /[&<>"']/;
 function escText(s) {
+  if (!ESC_TEXT_RE.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -74,7 +78,6 @@ function escText(s) {
       start = i + 1;
     }
   }
-  if (start === 0) return s;
   if (start < s.length) out += s.slice(start);
   return out;
 }
@@ -2513,10 +2516,15 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
 // is the item's content indent.
 function listBreakAt(line, R) {
   const maxInd = Math.max(0, Math.min(3, R - 1));
-  const info = leadInfo(line);
-  if (info.col > maxInd) return false;
-  const rest = line.slice(info.pos);
-  if (rest === '') return false;
+  let ind, pos;
+  if (line.charCodeAt(0) !== 32 && line.charCodeAt(0) !== 9) { ind = 0; pos = 0; }
+  else { const info = leadInfo(line); ind = info.col; pos = info.pos; }
+  if (ind > maxInd) return false;
+  const first = line[pos];
+  // only these first characters can break a list item (a blank
+  // line has no first character and cannot break it)
+  if (first !== '-' && first !== '*' && first !== '_' && first !== '#' && first !== '`' && first !== '~' && first !== '>' && first !== '<' && first !== '+' && !(first >= '0' && first <= '9')) return false;
+  const rest = line.slice(pos);
   if (isHr(rest)) return true;
   if (matchAtx(rest)) return true;
   // a fence start: 3+ backticks or tildes (the info is not
@@ -2529,7 +2537,7 @@ function listBreakAt(line, R) {
   if (rest[0] === '>') return true;
   const ht = htmlBlockType(rest);
   if (ht >= 1 && ht <= 6) return true;
-  if (matchListMarker(rest, info.col)) return true;
+  if (matchListMarker(rest, ind)) return true;
   return false;
 }
 
@@ -2549,9 +2557,10 @@ function looksLikeSetext(firstContent, line) {
 
 function renderList(L, start, ctx, out, listIndent) {
   const firstLine = L[start];
-  const firstInfo = leadInfo(firstLine);
-  const firstRest = firstLine.slice(firstInfo.pos);
-  const firstMarker = matchListMarker(firstRest, firstInfo.col);
+  let firstInd, firstPos;
+  if (firstLine.charCodeAt(0) !== 32 && firstLine.charCodeAt(0) !== 9) { firstInd = 0; firstPos = 0; }
+  else { const fi = leadInfo(firstLine); firstInd = fi.col; firstPos = fi.pos; }
+  const firstMarker = matchListMarker(firstLine.slice(firstPos), firstInd);
   const ordered = firstMarker.ordered;
   const delim = firstMarker.delim;
   const bullet = firstMarker.bullet;
@@ -2571,15 +2580,20 @@ function renderList(L, start, ctx, out, listIndent) {
       i++;
       continue;
     }
-    const info = leadInfo(line);
-    const ind = info.col;
-    const rest = line.slice(info.pos);
+    let ind, pos;
+    if (line.charCodeAt(0) !== 32 && line.charCodeAt(0) !== 9) { ind = 0; pos = 0; }
+    else { const info = leadInfo(line); ind = info.col; pos = info.pos; }
+    const first = line[pos];
+    // isHr / matchListMarker can only trigger on these first
+    // characters; other lines skip the slice and both calls
+    const needRest = first === '-' || first === '*' || first === '_' || first === '+' || (first >= '0' && first <= '9');
+    const rest = needRest ? line.slice(pos) : null;
     // an hr line ends the list, but only when it is not a
     // continuation of the current item (a '---' line at indent
     // >= the item's content indent is a setext underline inside
     // the item, not an hr)
-    if ((curItem === null || ind < curItem.contentIndent) && ind <= 3 && isHr(rest)) break;
-    const lm = ind <= 3 ? matchListMarker(rest, ind) : null;
+    if (needRest && (curItem === null || ind < curItem.contentIndent) && ind <= 3 && isHr(rest)) break;
+    const lm = (needRest && ind <= 3) ? matchListMarker(rest, ind) : null;
     // new item of this list? A marker whose indent is below the
     // current item's content indent starts a sibling item; a marker
     // of a different list type at that level ends this list. For
