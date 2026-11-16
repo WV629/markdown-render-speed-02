@@ -2076,19 +2076,24 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
   while (i < n) {
     const line = L[i];
     if (isBlank(line)) { if (state) state._sawBlank = true; i++; continue; }
-    const info = leadInfo(line);
-    const ind = info.col;
-    const rest = line.slice(info.pos);
+    // fast indent: most lines start at column 0 (no leadInfo object,
+    // no slice); first is the first non-whitespace character, rest
+    // is sliced only inside the branches that need it
+    let ind, pos;
+    if (line.charCodeAt(0) !== 32 && line.charCodeAt(0) !== 9) { ind = 0; pos = 0; }
+    else { const info = leadInfo(line); ind = info.col; pos = info.pos; }
+    const first = line[pos];
+    let rest = null;
 
     // link reference definition
-    if (ind <= 3) {
+    if (ind <= 3 && first === '[') {
       const used = parseLinkDef(L, i, ctx.refs);
       if (used > 0) { noteBlock(state, 'def'); i += used; continue; }
     }
 
     // ATX heading
-    if (ind <= 3) {
-      const atx = matchAtx(rest);
+    if (ind <= 3 && first === '#') {
+      const atx = matchAtx(line.slice(pos));
       if (atx) {
         noteBlock(state, 'heading');
         out.push('<h' + atx[0] + '>');
@@ -2100,8 +2105,8 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
     }
 
     // fenced code
-    if (ind <= 3) {
-      const fence = matchFence(rest);
+    if (ind <= 3 && (first === '`' || first === '~')) {
+      const fence = matchFence(line.slice(pos));
       if (fence) {
         noteBlock(state, 'code');
         const fch = fence[0];
@@ -2137,7 +2142,7 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
           if (fch === '`' && ind > 0) {
             let ws = 0;
             while (ws < cl.length && (cl[ws] === ' ' || cl[ws] === '\t')) ws++;
-            const strip = Math.min(ws, info.pos);
+            const strip = Math.min(ws, pos);
             codeLines.push(strip > 0 ? cl.slice(strip) : cl);
           } else {
             codeLines.push(cl);
@@ -2154,7 +2159,7 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
     }
 
     // thematic break
-    if (ind <= 3 && isHr(rest)) {
+    if (ind <= 3 && (first === '-' || first === '*' || first === '_') && isHr(line.slice(pos))) {
       noteBlock(state, 'hr');
       out.push('<hr>\n');
       i++;
@@ -2195,7 +2200,8 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
     }
 
     // HTML block
-    if (ind <= 3 && rest[0] === '<') {
+    if (ind <= 3 && first === '<') {
+      rest = line.slice(pos);
       const htype = htmlBlockType(rest);
       if (htype > 0) {
         noteBlock(state, 'html');
@@ -2261,7 +2267,7 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
     }
 
     // blockquote
-    if (ind <= 3 && rest[0] === '>') {
+    if (ind <= 3 && first === '>') {
       noteBlock(state, 'blockquote');
       // Collect the quote's extent: '>' lines, plus lazy
       // paragraph continuation lines (not blank, not interrupting
@@ -2408,8 +2414,8 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
     }
 
     // list
-    if (ind <= 3) {
-      const lm = matchListMarker(rest, ind);
+    if (ind <= 3 && (first === '-' || first === '*' || first === '+' || (first >= '0' && first <= '9'))) {
+      const lm = matchListMarker(line.slice(pos), ind);
       if (lm) {
         noteBlock(state, 'list');
         i = renderList(L, i, ctx, out, ind);
