@@ -73,6 +73,26 @@ function trimEndChars(s, ch, not) {
   return s.slice(0, n - k);
 }
 
+// First line of `s` (without its newline), without allocating a split
+// array the way `s.split('\n', 1)[0]` does.
+// Does `s` end with two consecutive blank-ish lines (`\n` + optional
+// spaces/tabs + `\n` + optional spaces/tabs)? A scan from the end
+// instead of the `/\n[ \t]*\n[ \t]*$/` regex, which walks the whole
+// string looking for a match that can only end at the string's end.
+function endsDoubleBlank(s) {
+  let i = s.length - 1;
+  while (i >= 0 && (s[i] === ' ' || s[i] === '\t')) i--;
+  if (i < 0 || s[i] !== '\n') return false;
+  i--;
+  while (i >= 0 && (s[i] === ' ' || s[i] === '\t')) i--;
+  return i >= 0 && s[i] === '\n';
+}
+
+function firstLineOf(s) {
+  const nl = s.indexOf('\n');
+  return nl < 0 ? s : s.slice(0, nl);
+}
+
 // Expand tabs to spaces the way marked does when it measures indentation.
 function expandTabs(s, offset) {
   let t = offset || 0;
@@ -198,7 +218,6 @@ const RE_TAB_G = /\t/g;
 const RE_LEAD_SPACE_TAB = /^[ \t]+/;
 const RE_MULTI_SPACE_G = /\s+/g;
 const RE_BLANK = /^[ \t]*$/;
-const RE_DOUBLE_BLANK = /\n[ \t]*\n[ \t]*$/;
 const RE_BQ_START = /^ {0,3}>/;
 const RE_BQ_SETEXT = /\n {0,3}((?:=+|-+)[ \t]*)(?=\n|$)/g;
 const RE_BQ_SETEXT2 = /^ {0,3}>[ \t]?/gm;
@@ -335,6 +354,36 @@ const URL_EMAIL = /[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-
 const INLINE_URL = tmpl(/^emailProtocol|^((?:protocol):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*|^email/)
   .replace('emailProtocol', MAILTO_RE).replace('protocol', SCHEME_RE).replace('email', URL_EMAIL).regex();
 const BACKPEDAL = /(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/;
+
+// Cheap pre-check for the autolink-URL regex: it can only match when
+// the text ahead starts with `www.`, a scheme (`http`/`https`/`ftp`),
+// a `mailto:`/`xmpp:` prefix, or an email local part followed by `@`.
+// Running the full regex on every text run costs a scan of the first
+// word; this guard replaces it with a few character comparisons.
+function urlMaybe(rest) {
+  const c = rest.charCodeAt(0);
+  if (c === 119 && rest.startsWith('www.')) return true; // w
+  if (c === 109 && rest.startsWith('mailto:')) return true; // m
+  if (c === 120 && rest.startsWith('xmpp:')) return true; // x
+  if (c === 104 || c === 72) { // h/H: http(s)
+    if ((rest.charCodeAt(1) | 32) === 116 && (rest.charCodeAt(2) | 32) === 116
+      && (rest.charCodeAt(3) | 32) === 112) return true;
+  }
+  if (c === 102 || c === 70) { // f/F: ftp
+    if ((rest.charCodeAt(1) | 32) === 116 && (rest.charCodeAt(2) | 32) === 112) return true;
+  }
+  // Email: a local-part run ([A-Za-z0-9._+-]) ending at `@`.
+  if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    || c === 46 || c === 95 || c === 43 || c === 45) {
+    for (let i = 1; i < rest.length; i++) {
+      const d = rest.charCodeAt(i);
+      if (d === 64) return true; // @
+      if (!((d >= 48 && d <= 57) || (d >= 65 && d <= 90) || (d >= 97 && d <= 122)
+        || d === 46 || d === 95 || d === 43 || d === 45)) return false;
+    }
+  }
+  return false;
+}
 const INLINE_TEXT = tmpl(/^(?:[^a-zA-Z0-9](?=emailProtocol)|(`+|~+|[^`~])(?:(?=[`~])|(?= {2,}\n)|(?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@)|[\s\S]*?(?:(?=[\\<!\[`*~_]|\b_|protocol:\/\/|wwwStart|$)|[^ ](?= {2,}\n)|[^a-zA-Z0-9](?=emailProtocol)|[^a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-](?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@))))/)
   .replace('protocol', SCHEME_RE)
   .replace(/emailProtocol/g, /(?:mailto|xmpp):/)
@@ -407,10 +456,21 @@ function lexBlocks(src, ctx, into, inBq) {
     if (src.length < guard) guard = src.length;
     else throw new Error('Infinite loop on byte: ' + src.charCodeAt(0));
     let tok = null;
-
+    let m;
+    // First-character dispatch: a block starting with an ordinary
+    // character (not a newline, space, tab, or one of `# - _ * + > < [`
+    // backtick, tilde, digit) can only be a table, a setext heading, a
+    // paragraph or plain text, so the other nine rules cannot match and
+    // are skipped outright.
+    const c0 = src.charCodeAt(0);
+    const plainStart = c0 !== 10 && c0 !== 32 && c0 !== 9
+      && c0 !== 96 && c0 !== 126 && c0 !== 35 && c0 !== 45 && c0 !== 95
+      && c0 !== 42 && c0 !== 43 && c0 !== 62 && c0 !== 60 && c0 !== 91
+      && !(c0 >= 48 && c0 <= 57);
+    if (!plainStart) {
     // Blank lines. A single newline just extends the previous token's
     // raw text; anything longer becomes a space token of its own.
-    let m = BLOCK_NEWLINE.exec(src);
+    m = BLOCK_NEWLINE.exec(src);
     if (m && m[0].length > 0) {
       src = src.substring(m[0].length);
       const prev = into[into.length - 1];
@@ -504,6 +564,7 @@ function lexBlocks(src, ctx, into, inBq) {
         }
         continue;
       }
+    }
     }
     // GFM table.
     tok = lexTable(src);
@@ -652,10 +713,10 @@ function lexList(src, ctx) {
     if (!it || BLOCK_HR.test(rest)) break;
     const startPos = all.length - rest.length;
     rest = rest.substring(it[0].length);
-    const firstLine = it[2].split('\n', 1)[0];
+    const firstLine = firstLineOf(it[2]);
     const indent = it[1].length;
     let markerText = firstLine.replace(RE_LEAD_SPACE_TAB, (v) => expandTabs(v, indent));
-    let nextLine = rest.split('\n', 1)[0];
+    let nextLine = firstLineOf(rest);
     let isEmpty = !markerText.trim();
     let width = 0;
     if (isEmpty && RE_BLANK.test(nextLine)) {
@@ -677,15 +738,33 @@ function lexList(src, ctx) {
       const htmlHere = htmlBeginRe(width);
       const bqHere = bqBeginRe(width);
       while (rest) {
-        const line = rest.split('\n', 1)[0];
+        const line = firstLineOf(rest);
         nextLine = line;
-        const stripped = line.replace(RE_LEAD_SPACE_TAB, (v) => expandTabs(v));
-        if (fencesHere.test(line) || headingHere.test(line) || htmlHere.test(line)
-          || bqHere.test(line) || nextBullet.test(line) || hrHere.test(line)) break;
-        if (stripped.search(RE_NON_SPACE) >= width || !line.trim()) {
+        // Most lines start with a non-space character, for which the
+        // leading-whitespace replace is a no-op; skip calling it then.
+        const stripped = (line.charCodeAt(0) === 32 || line.charCodeAt(0) === 9)
+          ? line.replace(RE_LEAD_SPACE_TAB, (v) => expandTabs(v)) : line;
+        // First-character dispatch: only the block-start tests whose
+        // first character matches the line's first non-space character
+        // can match, so a plain prose line runs none of the six.
+        const ns = stripped.search(RE_NON_SPACE);
+        const fc = ns < 0 ? -1 : stripped.charCodeAt(ns);
+        let blocked = false;
+        if (fc === 96 || fc === 126) blocked = fencesHere.test(line);
+        else if (fc === 35) blocked = headingHere.test(line);
+        else if (fc === 60) blocked = htmlHere.test(line);
+        else if (fc === 62) blocked = bqHere.test(line);
+        else if (fc === 42 || fc === 43 || fc === 45 || (fc >= 48 && fc <= 57)) {
+          blocked = nextBullet.test(line)
+            || ((fc === 45 || fc === 42) && hrHere.test(line));
+        } else if (fc === 95) blocked = hrHere.test(line);
+        if (blocked) break;
+        if (ns >= width || !line.trim()) {
           content += '\n' + stripped.slice(width);
         } else {
-          if (isEmpty || markerText.replace(RE_TAB_G, '    ').search(RE_NON_SPACE) >= 4
+          if (isEmpty || (markerText.includes('\t')
+              ? markerText.replace(RE_TAB_G, '    ').search(RE_NON_SPACE)
+              : markerText.search(RE_NON_SPACE)) >= 4
             || fencesHere.test(markerText) || headingHere.test(markerText)
             || htmlHere.test(markerText) || hrHere.test(markerText)) break;
           const setext = /^ {0,3}(?:=+|-+) *$/.test(line)
@@ -703,7 +782,7 @@ function lexList(src, ctx) {
     const itemRaw = all.slice(startPos, all.length - rest.length);
     if (!list.loose) {
       if (sawBlank) list.loose = true;
-      else if (RE_DOUBLE_BLANK.test(itemRaw)) sawBlank = true;
+      else if (endsDoubleBlank(itemRaw)) sawBlank = true;
     }
     list.items.push({
       t: 'list_item', raw: itemRaw,
@@ -804,43 +883,77 @@ function maskSource(src, ctx) {
   }
   // Punctuation runs outside code spans become `+` runs, except that a
   // match at offset 0 keeps its first character (so the very first
-  // character of the source still reads as itself).
-  t = t.replace(ANY_PUNCT_OUTSIDE_CODE, (n, ticks, offset) =>
-    offset ? '+'.repeat(n.length)
-    : ticks ? ticks + n.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks
-    : n);
-  // Whole links, code spans and tags become `[aaa...]`.
-  t = t.replace(BLOCK_SKIP, (n) => '[' + 'a'.repeat(n.length - 2) + ']');
+  // character of the source still reads as itself). The pattern only
+  // matches code spans and escaped punctuation, so with no backtick and
+  // no backslash in the string there is nothing to replace.
+  if (t.includes('`') || t.includes('\\')) {
+    t = t.replace(ANY_PUNCT_OUTSIDE_CODE, (n, ticks, offset) =>
+      offset ? '+'.repeat(n.length)
+      : ticks ? ticks + n.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks
+      : n);
+  }
+  // Whole links, code spans and tags become `[aaa...]`. None of those
+  // can occur without one of `[`, backtick or `<` in the source.
+  if (t.includes('[') || t.includes('`') || t.includes('<')) {
+    t = t.replace(BLOCK_SKIP, (n) => '[' + 'a'.repeat(n.length - 2) + ']');
+  }
   return t;
 }
 
-// Where in the masked source can a run of `ch` (`*`, `_` or `~`) last
-// close an opener? The last run whose preceding character is not
-// whitespace. Returns -1 when there is none.
-function lastCloserIndex(masked, ch) {
-  let last = -1;
-  for (let i = 0; i < masked.length; i++) {
+// Where in the masked source can a run of each delimiter last close
+// an opener? One pass over the masked source, recording the last run
+// of `*`, `_` and `~` whose preceding character is not whitespace.
+function lastCloserAll(masked) {
+  let star = -1, und = -1, tilde = -1;
+  for (let i = 0; i < masked.length;) {
     const c = masked[i];
-    if (c !== '*' && c !== '_' && c !== '~') continue;
-    if (c !== ch) { while (i + 1 < masked.length && masked[i + 1] === c) i++; continue; }
-    const prev = i === 0 ? '\n' : masked[i - 1];
+    if (c !== '*' && c !== '_' && c !== '~') { i++; continue; }
     let j = i;
     while (j < masked.length && masked[j] === c) j++;
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') last = i;
-    i = j - 1;
+    const prev = i === 0 ? '\n' : masked[i - 1];
+    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
+      if (c === '*') star = i;
+      else if (c === '_') und = i;
+      else tilde = i;
+    }
+    i = j;
   }
-  return last;
+  return { star, und, tilde };
+}
+
+// Code-point length of a delimiter run plus its following character:
+// only that final character can be astral, so only it needs the check
+// (a spread would allocate an array on every emphasis attempt).
+function runCodeLen(s) {
+  const n = s.length;
+  const last = s.charCodeAt(n - 1);
+  return n - (last >= 0xDC00 && last <= 0xDFFF ? 1 : 0);
+}
+
+// UTF-16 length of the first code point of `s`: 2 when it starts with
+// a high surrogate, 1 otherwise.
+function firstCodeLen(s) {
+  const first = s.charCodeAt(0);
+  return first >= 0xD800 && first <= 0xDBFF ? 2 : 1;
 }
 
 // Try to read an emphasis or strong span starting at `pos` in `src`.
-// `masked` is the full masked source, `prev` the character before the
-// run (or ''), and `closer` the last possible closer index for this
-// delimiter. Returns { raw, inner } or null.
-function tryEmStrong(src, masked, pos, prev, closer) {
+// `prev` is the character before the run (or ''), and `getMask`
+// materialises the masked source and its last-closer indexes on first
+// use. Returns { raw, inner } or null.
+function tryEmStrong(src, pos, prev, getMask) {
   const e = src.slice(pos);
   const s = EM_LDELIM.exec(e);
   if (!s || (!s[1] && !s[2] && !s[3] && !s[4])) return null;
   const delim = s[0][0];
+  // Fast rejection without the mask: a `_` opener followed by a word
+  // character while preceded by one (an identifier like `foo_bar`) can
+  // never open. When the preceding character is a word character the
+  // delimiter run cannot extend to the left, so this test is exact; the
+  // same check runs again below with the masked predecessor.
+  if (s[4] && RE_UNICODE_ALNUM.test(prev)) return null;
+  const { masked, star, und } = getMask();
+  const closer = delim === '*' ? star : und;
   const sameBefore = prev === delim;
   const i = pos;
   let l = i;
@@ -854,7 +967,7 @@ function tryEmStrong(src, masked, pos, prev, closer) {
   // An opener must be left-flanking (or at the start): it may not be
   // followed by punctuation while preceded by a word character.
   if (afterPunct && prev && !prevIsPunct) return null;
-  const k = [...s[0]].length - 1; // delimiters in the opening run
+  const k = runCodeLen(s[0]) - 1; // delimiters in the opening run
   let need = k, extra = 0;
   const runTotal = i - l + k;
   const canCloseOdd = !!beforeRun.trim() && (!!afterPunct || (delim === '*' && !beforeIsPunct));
@@ -868,7 +981,7 @@ function tryEmStrong(src, masked, pos, prev, closer) {
   while ((m = rx.exec(rest)) !== null && !(m.index > limit)) {
     const g = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
     if (!g) continue;
-    const b = [...g].length;
+    const b = g.length;
     if (m[3] || m[4]) { need += b; continue; }
     if (m[5] || m[6] || canCloseOdd) {
       if (sameBefore && (m[5] || m[6])) break;
@@ -877,7 +990,7 @@ function tryEmStrong(src, masked, pos, prev, closer) {
     need -= b;
     if (need > 0) continue;
     const use = Math.min(b, b + need + extra);
-    const firstLen = [...m[0]][0].length;
+    const firstLen = firstCodeLen(m[0]);
     const raw = e.slice(0, k + m.index + firstLen + use);
     if (Math.min(k, use) % 2) return { raw, inner: raw.slice(1, -1), strong: false };
     return { raw, inner: raw.slice(2, -2), strong: true };
@@ -886,14 +999,16 @@ function tryEmStrong(src, masked, pos, prev, closer) {
 }
 
 // Try to read a `~~...~~` strikethrough span starting at `pos`.
-function tryDel(src, masked, pos, prev, closer) {
+function tryDel(src, pos, prev, getMask) {
   const e = src.slice(pos);
   const s = DEL_LDELIM.exec(e);
   if (!s) return null;
   // Same left-flanking gate as emphasis: no opener when followed by
   // punctuation and preceded by a word character.
   if ((s[1] || '') && prev && !PUNCT_TEST.exec(prev)) return null;
-  const open = [...s[0]].length - 1; // 1 or 2 tildes
+  const { masked, tilde } = getMask();
+  const closer = tilde;
+  const open = runCodeLen(s[0]) - 1; // 1 or 2 tildes
   let need = open;
   const afterOpen = pos + open;
   if (closer < afterOpen) return null;
@@ -904,17 +1019,103 @@ function tryDel(src, masked, pos, prev, closer) {
   while ((m = DEL_RDELIM.exec(rest)) !== null && !(m.index > limit)) {
     const g = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
     if (!g) continue;
-    const len = [...g].length;
+    const len = g.length;
     if (len !== open) continue;
     if (m[3] || m[4]) { need += len; continue; }
     need -= len;
     if (need > 0) continue;
     const use = Math.min(len, len + need);
-    const firstLen = [...m[0]][0].length;
+    const firstLen = firstCodeLen(m[0]);
     const raw = e.slice(0, open + m.index + firstLen + use);
     return { raw, inner: raw.slice(open, -open) };
   }
   return null;
+}
+
+// The characters and prefixes at which a plain-text run must stop, so
+// the inline loop can hand control back to the special-case branches:
+// a backslash, a tag or code-span opener, a link or image opener, an
+// emphasis or strikethrough delimiter, an underscore at a word boundary,
+// a hard break, a bare `@` that starts an email, or the start of a
+// `www.` / scheme / `mailto:` autolink. A match that cannot start one
+// of those (an underscore inside a word, a `www.` after a letter, a
+// `mailto:` after a word character, a bare `@`) is skipped over.
+const TEXT_STOP = /[\\`<[!*~_@]| {2,}\n|www\.|https?:\/\/|ftp:\/\/|mailto:|xmpp:/gi;
+const isWordCode = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+  || (c >= 97 && c <= 122) || c === 95;
+const isAlnumCode = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+const isEmailCode = (c) => isAlnumCode(c) || c === 46 || c === 33 || c === 35 || c === 36
+  || c === 37 || c === 38 || c === 39 || c === 42 || c === 43 || c === 47 || c === 61
+  || c === 63 || c === 94 || c === 95 || c === 96 || c === 123 || c === 124 || c === 125 || c === 126
+  || c === 45;
+
+// End index of the plain-text run at the start of `rest`: the position
+// where marked's text rule would stop, so the run appended here is
+// exactly the text the text rule would have matched. Returns 0 when the
+// first character needs special handling.
+function textScanEnd(rest) {
+  // Where an email-character run followed by `@` starts, for a `@` at or
+  // after `q` (or -1 when there is none in the run). The text rule stops
+  // at that start, whatever precedes it, so a stop found later in the
+  // run must give way to it. Results are memoised: the stops arrive in
+  // order, so a later scan only re-walks what an earlier one covered.
+  let memoEnd = -1, memoAt = -1, memoE0 = -1;
+  const emailRunStart = (q) => {
+    if (q < memoEnd) return memoAt < 0 ? -1 : memoE0;
+    let i = q;
+    while (i < rest.length && isEmailCode(rest.charCodeAt(i))) i++;
+    memoEnd = i;
+    if (i >= rest.length || rest.charCodeAt(i) !== 64) { memoAt = -1; return -1; }
+    memoAt = i;
+    let e0 = i;
+    while (e0 > 0 && isEmailCode(rest.charCodeAt(e0 - 1))) e0--;
+    memoE0 = e0;
+    return e0;
+  };
+  TEXT_STOP.lastIndex = 0;
+  let m;
+  while ((m = TEXT_STOP.exec(rest)) !== null) {
+    const q = m.index;
+    // An email starting before this stop fires first.
+    const e0 = emailRunStart(q);
+    if (e0 >= 0 && e0 < q) return e0;
+    const lower = m[0].toLowerCase();
+    if (lower === 'www.') {
+      if (q === 0) return 0;
+      const p = rest[q - 1];
+      if (p === ' ' || p === '\t' || p === '\n' || p === '\r' || p === '\f' || p === '\v'
+        || p === '*' || p === '_' || p === '~' || p === '(') return q;
+      TEXT_STOP.lastIndex = q + 1;
+      continue;
+    }
+    if (lower === 'mailto:' || lower === 'xmpp:') {
+      if (q === 0) return 0;
+      if (!isAlnumCode(rest.charCodeAt(q - 1))) return q;
+      TEXT_STOP.lastIndex = q + 1;
+      continue;
+    }
+    if (m[0] === '_') {
+      if (q === 0) return 0;
+      if (isWordCode(rest.charCodeAt(q - 1))) { TEXT_STOP.lastIndex = q + 1; continue; }
+      return q;
+    }
+    if (m[0] === '@') {
+      if (e0 === q) { TEXT_STOP.lastIndex = q + 1; continue; } // bare @: plain text
+      if (e0 === 0) return 0; // the email starts here; let the loop link it
+      return e0;
+    }
+    return q;
+  }
+  return rest.length;
+}
+
+// Escape a plain-text run the way the text rule does. Most runs need
+// no escaping at all, so one cheap test replaces two function calls
+// and their scans; a run inside a raw block is pushed as-is.
+function escText(raw, plain, inRawBlock) {
+  if (inRawBlock) return raw;
+  if (plain) return raw.includes('&') ? unescapeEntities(raw) : raw;
+  return ESC_TEST.test(raw) ? esc(unescapeEntities(raw)) : raw;
 }
 
 // Render one inline source to HTML (`plain` renders to plain text, the
@@ -924,10 +1125,24 @@ function inlineRun(src, ctx, parenPossible, plain) {
   const st = ctx.istate;
   if (!src) return '';
   const needsMask = src.includes('*') || src.includes('_') || src.includes('~');
-  const masked = needsMask ? maskSource(src, ctx) : src;
-  const closerStar = needsMask ? lastCloserIndex(masked, '*') : -1;
-  const closerUnd = needsMask ? lastCloserIndex(masked, '_') : -1;
-  const closerTilde = needsMask ? lastCloserIndex(masked, '~') : -1;
+  // The masked twin and the last-closer indexes are built lazily: most
+  // sources with a delimiter in them never open emphasis at all (an
+  // underscore inside an identifier, a lone asterisk), and for those the
+  // masking passes are pure overhead. The first emphasis or
+  // strikethrough attempt that can actually open materialises them once
+  // and reuses them for the rest of this source. When the source holds
+  // no link, code span, tag or escaped punctuation, the masking passes
+  // change nothing and the source itself is the masked twin.
+  let mask = null;
+  const getMask = () => {
+    if (!mask) {
+      const needsWork = src.includes('[') || src.includes('`') || src.includes('<')
+        || src.includes('\\');
+      const masked = needsWork ? maskSource(src, ctx) : src;
+      mask = { masked, ...lastCloserAll(masked) };
+    }
+    return mask;
+  };
   const linkParen = parenPossible && src.includes(')');
   const out = [];
   let pos = 0;
@@ -949,6 +1164,18 @@ function inlineRun(src, ctx, parenPossible, plain) {
     const rest = src.slice(pos);
     const c = rest[0];
     let m;
+
+    // Fast path: a plain-text run up to the next special character,
+    // appended in one go instead of one regex match per token.
+    const scanEnd = textScanEnd(rest);
+    if (scanEnd > 0) {
+      const raw = rest.slice(0, scanEnd);
+      out.push(escText(raw, plain, st.inRawBlock));
+      if (raw.slice(-1) !== '_') prevChar = raw.slice(-1);
+      prevWasText = true;
+      pos += scanEnd;
+      continue;
+    }
 
     // Backslash escape.
     if (c === '\\' && (m = INLINE_ESCAPE.exec(rest))) {
@@ -987,7 +1214,7 @@ function inlineRun(src, ctx, parenPossible, plain) {
     }
     // Emphasis / strong.
     if ((c === '*' || c === '_') && needsMask) {
-      const em = tryEmStrong(src, masked, pos, prevChar, c === '*' ? closerStar : closerUnd);
+      const em = tryEmStrong(src, pos, prevChar, getMask);
       if (em) {
         const inner = nested(em.inner);
         out.push(plain ? inner : em.strong ? `<strong>${inner}</strong>` : `<em>${inner}</em>`);
@@ -1015,7 +1242,7 @@ function inlineRun(src, ctx, parenPossible, plain) {
     }
     // Strikethrough.
     if (c === '~' && needsMask) {
-      const del = tryDel(src, masked, pos, prevChar, closerTilde);
+      const del = tryDel(src, pos, prevChar, getMask);
       if (del) {
         const inner = nested(del.inner);
         out.push(plain ? inner : `<del>${inner}</del>`);
@@ -1033,7 +1260,7 @@ function inlineRun(src, ctx, parenPossible, plain) {
       continue;
     }
     // GFM autolink: www., scheme://, email (never inside a link).
-    if (!st.inLink && (m = INLINE_URL.exec(rest))) {
+    if (!st.inLink && urlMaybe(rest) && (m = INLINE_URL.exec(rest))) {
       let text, href;
       if (m[2] === '@') { text = m[0]; href = 'mailto:' + m[0]; }
       else {
@@ -1051,9 +1278,7 @@ function inlineRun(src, ctx, parenPossible, plain) {
     m = INLINE_TEXT.exec(rest);
     if (m) {
       const raw = m[0];
-      if (st.inRawBlock) out.push(raw);
-      else if (plain) out.push(unescapeEntities(raw));
-      else out.push(esc(unescapeEntities(raw)));
+      out.push(escText(raw, plain, st.inRawBlock));
       if (raw.slice(-1) !== '_') prevChar = raw.slice(-1);
       prevWasText = true;
       pos += raw.length;
@@ -1134,15 +1359,21 @@ function finishLink(m, def, ctx, parenPossible, plain, nested, nestedPlain) {
   st.linkEmitted = false;
   const innerHtml = nested(textSrc);
   const innerEmitted = st.linkEmitted;
+  // The plain rendering (image alt text, or a link inside plain text)
+  // is tokenized here too, while inLink is still set: marked tokenizes
+  // the link text once with inLink on, so a bare URL after a backslash
+  // is not swallowed into an autolink inside alt text, and a hard break
+  // after one still counts. Only built when it is actually used.
+  const plainHtml = (isImage || plain) ? nestedPlain(textSrc) : null;
   st.linkEmitted = savedEmitted;
   st.inLink = savedInLink;
   if (!isImage) {
     if (innerEmitted) return null;
     st.linkEmitted = true;
   }
-  if (plain) return { html: nestedPlain(textSrc), len: m[0].length };
+  if (plain) return { html: plainHtml, len: m[0].length };
   if (isImage) {
-    const alt = nestedPlain(textSrc);
+    const alt = plainHtml;
     const encoded = encodeHref(def.href);
     if (encoded === null) return { html: esc(alt), len: m[0].length };
     let out = `<img src="${esc(encoded)}" alt="${esc(alt)}"`;
