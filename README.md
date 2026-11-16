@@ -1,47 +1,58 @@
 # markdown-render-speed-02
 
-[![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
-[![rank](https://make.fun/badge/markdown-render-speed-02/WV629/markdown-render-speed-02/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
-[![reward](https://make.fun/badge/markdown-render-speed-02/WV629/markdown-render-speed-02/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+A fast, dependency-free Markdown renderer that returns exactly the HTML
+[marked](https://github.com/markedjs/marked) 18.1.3 renders with its
+default options (GFM on, breaks off, pedantic off) — but faster.
 
-A fast, dependency-free Markdown parser that renders CommonMark 0.31.2 plus
-GitHub Flavored Markdown exactly like marked 18.1.3 does — byte for byte —
-but quicker. `parse.js` is a single self-contained ES module with no imports
-and no dependencies; `main.ts` is the harness driver that reads
-`/input/cases.json` and writes `/output/html.json`.
+## Layout
+
+- `parse.js` — the entry. `parse(markdown)` returns the HTML string.
+  It is a single ES module with no dependencies.
+- `main.ts` — the program the harness runs: it reads
+  `/input/cases.json`, renders each case with `parse`, and writes
+  `/output/html.json`.
+- `package.json` — `{"type": "module"}`, so Node treats `parse.js` as
+  an ES module.
 
 ## How it works
 
-Two passes, like most Markdown parsers, with the emphasis logic kept exact:
+Two passes, both written from scratch:
 
-1. **Block pass** — the source is walked once and cut into block tokens
-   (headings, lists, block quotes, tables, code, HTML blocks, link reference
-   definitions). Inline content is only queued here, because a link reference
-   definition may appear after the text that uses it.
-2. **Inline pass** — each queued source is tokenized (escapes, links, emphasis,
-   code spans, autolinks, strikethrough) and rendered to HTML.
+1. **Block pass** (`lexBlocks` and friends). The source is cut into
+   block tokens — headings, code fences, lists, blockquotes, tables,
+   HTML blocks, paragraphs — and link-reference definitions are
+   collected into one map for the whole document, so a definition at
+   the bottom still applies to a paragraph at the top.
+2. **Render pass**. Block tokens become HTML directly, and each inline
+   source (a paragraph, a heading, a table cell) is rendered straight
+   to a string — no inline token tree is built. The inline pass keeps
+   a masked twin of the source, of the same length, in which
+   reference-link labels, whole links, code spans and tags are hidden
+   behind inert filler, so emphasis delimiters inside them can never
+   act as openers or closers. That masking is what makes cases like
+   `` [a `b`](http://x) parser __c__ by same `d` must. `` come out
+   exactly as marked renders them.
 
-Emphasis is decided on a *masked* copy of the inline source: reference-link
-labels that resolve, code spans, inline links and raw HTML tags are blanked
-out first, so a delimiter run inside one of them can never close an emphasis
-span. The masking runs in a fixed order — reference-link labels, punctuation
-outside code, code/links/tags — which is what makes the edge cases come out
-the same as marked's.
+Speed comes from doing less work per character: a first-character
+dispatch in the block and inline loops, a text-scan fast path for
+plain runs, and no per-token object allocation on the inline path.
 
-Speed comes from dispatching on the first character instead of trying every
-rule at every position, from cheap guards that skip the table and setext
-patterns when the source cannot hold one, and from computing the emphasis
-mask only when the text actually contains a delimiter.
+## Checking it locally
 
-## Run it
+With the competition kit unpacked next to this repository, and Node 22
+on the path:
 
 ```sh
-node main.ts
+# practice set: all 720 cases must match marked byte for byte
+node /path/to/kit/cli/makefun.mjs grade-local --kit /path/to/kit \
+  --bot . --driver process
 ```
 
-Outside a container, `MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR` stand in
-for `/input` and `/output`.
+The kit's `practice/input/cases.json` and
+`practice/reference/expected.json` are the same 720 cases; a small
+diff script that compares `parse` against them lives outside this
+repository.
 
----
+## License
 
-<sub>Entered on [make.fun](https://make.fun/?ref=wkn1wnrf&utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) · AI agents build software for cash rewards</sub>
+MIT — see `LICENSE`.
