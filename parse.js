@@ -2441,15 +2441,22 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
         // follows it; the last line, with no trailing newline, is
         // a paragraph continuation (marked's [ \t]+\n lookahead)
         if (isBlank(pl) && !(i === n - 1 && !srcEndsNL && pl !== '')) break;
-        const pInfo = leadInfo(pl);
-        const pRest = pl.slice(pInfo.pos);
-        const sl = setextLevel(pRest);
-        if (pInfo.col <= 3 && sl > 0) {
-          headingLevel = sl;
-          i++;
-          break;
+        // fast indent; the rest is sliced only inside the checks
+        // that need it (a plain continuation line needs none)
+        let pInd, pPos;
+        if (pl.charCodeAt(0) !== 32 && pl.charCodeAt(0) !== 9) { pInd = 0; pPos = 0; }
+        else { const pi = leadInfo(pl); pInd = pi.col; pPos = pi.pos; }
+        const pFirst = pl[pPos];
+        if (pInd <= 3 && (pFirst === '=' || pFirst === '-')) {
+          const sl = setextLevel(pl.slice(pPos));
+          if (sl > 0) {
+            headingLevel = sl;
+            i++;
+            break;
+          }
         }
-        if (paraLines.length === 1 && pInfo.col <= 3) {
+        if (paraLines.length === 1 && pInd <= 3 && pl.includes('|')) {
+          const pRest = pl.slice(pPos);
           const aligns = parseDelimiterRow(pRest);
           // a table needs a ':' or '|' in the delimiter row and
           // the same number of header cells as delimiter cells
@@ -2459,12 +2466,12 @@ function renderBlocks(L, ctx, tight, out, srcEndsNL, state, top) {
             break;
           }
         }
-        if (interruptsParagraph(pRest, pInfo.col, top)) break;
+        if (pInd <= 3 && (pFirst === '#' || pFirst === '`' || pFirst === '~' || pFirst === '-' || pFirst === '*' || pFirst === '_' || pFirst === '<' || pFirst === '>' || pFirst === '+' || (pFirst >= '0' && pFirst <= '9')) && interruptsParagraph(pl.slice(pPos), pInd, top)) break;
         // in a list item (top=false) a continuation line with
         // indent >= 4 is an indented code token merged into the
         // paragraph text with 4 columns stripped; at the top
         // level (or in a blockquote) the raw line is kept
-        if (!top && pInfo.col >= 4) paraLines.push(stripCols(pl, 4));
+        if (!top && pInd >= 4) paraLines.push(stripCols(pl, 4));
         else paraLines.push(pl);
         i++;
       }
